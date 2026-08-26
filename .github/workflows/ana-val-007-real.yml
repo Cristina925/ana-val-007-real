@@ -1,0 +1,130 @@
+name: ANA-VAL-007-REAL Kubernetes
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ana-val-007-real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Freeze runner environment
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence
+          uname -a | tee evidence/uname.txt
+          docker version | tee evidence/docker-version.txt
+          go version | tee evidence/go-version.txt
+          python3 --version | tee evidence/python-version.txt
+
+      - name: Install kind v0.32.0
+        run: |
+          set -euxo pipefail
+          GOBIN="$HOME/bin" go install sigs.k8s.io/kind@v0.32.0
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/kind" version | tee evidence/kind-version.txt
+
+      - name: Prepare audit-enabled kind control plane
+        run: |
+          set -euxo pipefail
+          cat > /tmp/ana-val-007-audit-policy.yaml <<'EOF'
+          apiVersion: audit.k8s.io/v1
+          kind: Policy
+          rules:
+            - level: RequestResponse
+              namespaces: ["ana-val-007-real"]
+            - level: Metadata
+          EOF
+
+          cat > kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraMounts:
+                - hostPath: /tmp/ana-val-007-audit-policy.yaml
+                  containerPath: /etc/kubernetes/policies/audit-policy.yaml
+                  readOnly: true
+              kubeadmConfigPatches:
+                - |
+                  kind: ClusterConfiguration
+                  apiServer:
+                    extraArgs:
+                      audit-policy-file: /etc/kubernetes/policies/audit-policy.yaml
+                      audit-log-path: /var/log/kubernetes/audit.log
+                      audit-log-maxage: "1"
+                      audit-log-maxbackup: "1"
+                      audit-log-maxsize: "100"
+                    extraVolumes:
+                      - name: audit-policies
+                        hostPath: /etc/kubernetes/policies
+                        mountPath: /etc/kubernetes/policies
+                        readOnly: true
+                        pathType: DirectoryOrCreate
+                      - name: audit-logs
+                        hostPath: /var/log/kubernetes
+                        mountPath: /var/log/kubernetes
+                        readOnly: false
+                        pathType: DirectoryOrCreate
+          EOF
+          cp /tmp/ana-val-007-audit-policy.yaml evidence/audit-policy.yaml
+          cp kind-config.yaml evidence/kind-config.yaml
+
+      - name: Create real Kubernetes v1.36.1 control plane
+        run: |
+          set -euxo pipefail
+          kind create cluster \
+            --name ana-val-007 \
+            --config kind-config.yaml \
+            --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
+            --wait 180s
+          kubectl version -o yaml | tee evidence/kubernetes-version.yaml
+          kubectl cluster-info dump > evidence/cluster-info-dump.txt
+
+      - name: Start local API proxy
+        run: |
+          set -euxo pipefail
+          nohup kubectl proxy --port=8001 --address=127.0.0.1 > evidence/kubectl-proxy.log 2>&1 &
+          echo $! > evidence/kubectl-proxy.pid
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8001/version > evidence/api-version.json; then
+              break
+            fi
+            sleep 1
+          done
+          test -s evidence/api-version.json
+
+      - name: Execute frozen Q01-Q24 and R1-R5
+        run: |
+          set -euxo pipefail
+          python3 scripts/ana_val_007_real.py \
+            --api http://127.0.0.1:8001 \
+            --evidence evidence
+
+      - name: Capture final cluster state and audit evidence
+        if: always()
+        run: |
+          set +e
+          kubectl get ns ana-val-007-real -o json > evidence/final-namespace.json
+          kubectl get deployments -n ana-val-007-real -o json > evidence/final-deployments.json
+          kubectl get configmaps -n ana-val-007-real -o json > evidence/final-configmaps.json
+          kubectl get events -n ana-val-007-real -o json > evidence/final-events.json
+          docker logs ana-val-007-control-plane > evidence/kind-control-plane.log 2>&1
+          docker cp ana-val-007-control-plane:/var/log/kubernetes/audit.log evidence/kube-apiserver-audit.log
+          docker exec ana-val-007-control-plane crictl ps -a > evidence/crictl-ps.txt 2>&1
+          docker exec ana-val-007-control-plane sh -c 'ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt --key=/etc/kubernetes/pki/etcd/healthcheck-client.key endpoint status -w json' > evidence/etcd-endpoint-status.json 2>&1
+          sha256sum ANA-VAL-007-PRE-REGISTRATION.md scripts/ana_val_007_real.py .github/workflows/ana-val-007-real.yml > evidence/input-sha256.txt
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload frozen evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ANA-VAL-007-REAL-EVIDENCE
+          path: evidence/
+          if-no-files-found: error
